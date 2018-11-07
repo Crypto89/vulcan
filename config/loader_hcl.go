@@ -5,9 +5,9 @@ import (
 	"io/ioutil"
 
 	multierror "github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/hcl/hcl/ast"
-
 	"github.com/hashicorp/hcl"
+	"github.com/hashicorp/hcl/hcl/ast"
+	log "github.com/sirupsen/logrus"
 )
 
 type hclConfigurable struct {
@@ -16,15 +16,6 @@ type hclConfigurable struct {
 }
 
 func (t *hclConfigurable) Config() (*Config, error) {
-	validKeys := map[string]struct{}{
-		"file":     struct{}{},
-		"group":    struct{}{},
-		"package":  struct{}{},
-		"service":  struct{}{},
-		"user":     struct{}{},
-		"variable": struct{}{},
-	}
-
 	list, ok := t.Root.Node.(*ast.ObjectList)
 	if !ok {
 		return nil, fmt.Errorf("error parsing: file doesn't contain a root object")
@@ -40,27 +31,12 @@ func (t *hclConfigurable) Config() (*Config, error) {
 		}
 	}
 
-	if o := list.Filter("file"); len(o.Items) > 0 {
+	{
 		var err error
-		config.Files, err = loadFilesHcl(o)
+		config.Resources, err = loadResourcesHcl(list)
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	// Check for invalid keys
-	for _, item := range list.Items {
-		if len(item.Keys) == 0 {
-			// Not sure how this would happen, but let's avoid a panic
-			continue
-		}
-
-		k := item.Keys[0].Token.Value().(string)
-		if _, ok := validKeys[k]; ok {
-			continue
-		}
-
-		config.unknownKeys = append(config.unknownKeys, k)
 	}
 
 	return config, nil
@@ -87,44 +63,94 @@ func loadFileHcl(root string) (configurable, error) {
 	return result, nil
 }
 
-func loadFilesHcl(list *ast.ObjectList) ([]*File, error) {
-	if err := assertAllBlocksHaveNames("file", list); err != nil {
-		return nil, err
-	}
-
+func loadResourcesHcl(list *ast.ObjectList) (map[string][]*Resource, error) {
 	list = list.Children()
+	result := make(map[string][]*Resource)
 
-	result := make([]*File, len(list.Items))
 	for _, item := range list.Items {
-		unwrapHCLObjectKeysFromJSON(item, 1)
-
-		if len(item.Keys) != 1 {
-			return nil, fmt.Errorf(
-				"position %s: 'file' must be follow by exactly one string: a name",
-				item.Pos(),
-			)
+		if len(item.Keys) == 0 {
+			// Not sure how this would happen, but let's avoid a panic
+			continue
 		}
 
-		n := item.Keys[0].Token.Value().(string)
-		if !NameRegexp.MatchString(n) {
-			return nil, fmt.Errorf(
-				"position %s: 'file' name must match regular expression: %s",
-				item.Pos(), NameRegexp)
+		t := item.Keys[0].Token.Value().(string)
+		k := item.Keys[1].Token.Value().(string)
+
+		if t == "variable" {
+			// we already handled this, skip
+			continue
 		}
 
-		valid := []string{"destination", "content", "user", "group", "mode"}
-		if err := checkHCLKeys(item.Val, valid); err != nil {
-			return nil, multierror.Prefix(err, fmt.Sprintf(
-				"variable[%s]:", n))
+		if !NameRegexp.MatchString(k) {
+			return nil, fmt.Errorf("position %s: '%s' name must match regular expression: %s", item.Pos(), t, NameRegexp)
 		}
 
-		var hclFile File
-		if err := hcl.DecodeObject(&hclFile, item.Val); err != nil {
-			return nil, err
+		var listVal *ast.ObjectList
+		if ot, ok := item.Val.(*ast.ObjectType); ok {
+			listVal = ot.List
+		} else {
+			return nil, fmt.Errorf("resource %s[%s]: should be an object", t, k)
 		}
 
-		result = append(result, &hclFile)
+		var config map[string]interface{}
+		if err := hcl.DecodeObject(&config, item.Val); err != nil {
+			return nil, fmt.Errorf("Error reading config for %s[%s]: %s", t, k, err)
+		}
+
+		log.Debugf("Found resource: %s[%s]", t, k)
+		log.Debugf("Found config: %#v", config)
+
+		delete(config, "depends_on")
+
+		rawConfig, err := NewRawConfig(config)
+		if err != nil {
+			return nil, fmt.Errorf("Error reading config for %s[%s]: %s", t, k, err)
+		}
+
+		var dependsOn []string
+		if o := listVal.Filter("depends_on"); len(o.Items) > 0 {
+			err := hcl.DecodeObject(&dependsOn, o.Items[0].Val)
+			if err != nil {
+				return nil, fmt.Errorf("Error reading depends_on for %s[%s]: %s", t, k, err)
+			}
+		}
+
+		r := &Resource{
+			Name:      k,
+			Keys:      config,
+			RawConfig: rawConfig,
+		}
+
+		if _, ok := result[t]; !ok {
+			result[t] = []*Resource{}
+		}
+
+		result[t] = append(result[t], r)
 	}
+
+	// for _, item := range list.Items {
+	// 	unwrapHCLObjectKeysFromJSON(item, 1)
+
+	// 	if len(item.Keys) != 1 {
+	// 		return nil, fmt.Errorf(
+	// 			"position %s: 'file' must be follow by exactly one string: a name",
+	// 			item.Pos(),
+	// 		)
+	// 	}
+
+	// 	valid := []string{"destination", "content", "user", "group", "mode"}
+	// 	if err := checkHCLKeys(item.Val, valid); err != nil {
+	// 		return nil, multierror.Prefix(err, fmt.Sprintf(
+	// 			"variable[%s]:", n))
+	// 	}
+
+	// 	var hclFile File
+	// 	if err := hcl.DecodeObject(&hclFile, item.Val); err != nil {
+	// 		return nil, err
+	// 	}
+
+	// 	result = append(result, &hclFile)
+	// }
 
 	return result, nil
 }

@@ -18,10 +18,17 @@ type configurable interface {
 
 type Config struct {
 	Dir       string
-	Files     []*File
+	Resources map[string][]*Resource
 	Variables []*Variable
 
 	unknownKeys []string
+}
+
+type Resource struct {
+	Name      string
+	Keys      map[string]interface{}
+	RawConfig *RawConfig
+	DependsOn []string
 }
 
 type File struct {
